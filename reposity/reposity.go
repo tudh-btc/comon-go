@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	dtoMapper "github.com/dranikpg/dto-mapper"
 	"github.com/go-playground/validator/v10"
@@ -33,7 +34,7 @@ func Connect(sqlHost, sqlPort, sqlDbName, sqlSslmode, sqlUser, sqlPassword strin
 	defer dbMutex.Unlock()
 
 	if len(schemas) == 0 {
-		return errors.New("at least one schema must be provided")
+		return errors.New("phải cung cấp ít nhất một schema")
 	}
 
 	for _, currentSchema := range schemas {
@@ -44,38 +45,45 @@ func Connect(sqlHost, sqlPort, sqlDbName, sqlSslmode, sqlUser, sqlPassword strin
 			DSN: sqlDsn,
 		}), &gorm.Config{
 			NamingStrategy: schema.NamingStrategy{
-				TablePrefix:   currentSchema + ".", // schema name
-				SingularTable: true,                // use singular table name
+				TablePrefix:   currentSchema + ".", // tên schema
+				SingularTable: true,                // sử dụng tên bảng số ít
 			},
 		})
 
 		if err != nil {
-			return fmt.Errorf("failed to connect to database for schema %s: %w", currentSchema, err)
+			return fmt.Errorf("không thể kết nối tới cơ sở dữ liệu cho schema %s: %w", currentSchema, err)
 		}
 
-		// Add uuid-ossp extension for postgres database
+		// Thêm tiện ích mở rộng uuid-ossp cho cơ sở dữ liệu PostgreSQL
 		database.Exec("CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";")
+
+		// Cấu hình connection pool
+		sqlDB, err := database.DB()
+		if err != nil {
+			return fmt.Errorf("không thể lấy sql.DB cho schema %s: %w", currentSchema, err)
+		}
+
+		// Thiết lập các tham số connection pool
+		sqlDB.SetMaxIdleConns(10)                  // Số lượng idle connections tối đa
+		sqlDB.SetMaxOpenConns(100)                 // Số lượng kết nối mở tối đa
+		sqlDB.SetConnMaxLifetime(30 * time.Minute) // Thời gian sống tối đa của một kết nối
+		sqlDB.SetConnMaxIdleTime(5 * time.Minute)  // Thời gian idle connections tối đa trước khi đóng kết nối
+
+		// Kiểm tra cấu hình connection pool
+		stats := sqlDB.Stats()
+		if stats.MaxOpenConnections != 100 {
+			fmt.Printf("Cảnh báo: MaxOpenConnections cho schema %s không được thiết lập đúng, kỳ vọng 100, nhận được %d\n", currentSchema, stats.MaxOpenConnections)
+		}
 
 		dbMap[currentSchema] = database
 	}
 
-	// Set default schema as the first one provided
+	// Thiết lập schema mặc định là schema đầu tiên được cung cấp
 	defaultSchema = schemas[0]
 	Connected = true
 
-	// Todo: set connection pool for each database connection
-	/*
-		for _, db := range dbMap {
-			sqlDB, err := db.DB()
-			if err != nil {
-				return err
-			}
-			sqlDB.SetMaxIdleConns(10)
-			sqlDB.SetMaxOpenConns(100)
-			sqlDB.SetConnMaxLifetime(time.Hour)
-		}
-	*/
-	// Todo: optimize performance https://gorm.io/docs/performance.html
+	// TODO: Cho phép các tham số connection pool được cấu hình qua biến môi trường hoặc struct config
+	// TODO: Tối ưu hiệu suất thêm dựa trên hướng dẫn hiệu suất của GORM: https://gorm.io/docs/performance.html
 	return nil
 }
 
