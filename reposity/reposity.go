@@ -1,10 +1,11 @@
-package reposity
+package repository
 
 import (
 	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 
 	dtoMapper "github.com/dranikpg/dto-mapper"
 	"github.com/go-playground/validator/v10"
@@ -15,82 +16,102 @@ import (
 
 // Todo: use gorm smart select, then no need for mapping
 
-var Connected bool = false
+var (
+	Connected     bool = false
+	dbMap         map[string]*gorm.DB
+	dbMutex       sync.RWMutex
+	defaultSchema string
+)
 
-var defaultDB *gorm.DB
-
-type SQLQuery[M any, E any] struct {
-	expressStr string
-	args       []interface{}
-	db         *gorm.DB
+func init() {
+	dbMap = make(map[string]*gorm.DB)
 }
 
-func Connect(sqlHost, sqlPort, sqlDbName, sqlSslmode, sqlUser, sqlPassword, currentSchema string) error {
-	sqlDsn := fmt.Sprintf("host=%s port=%s dbname=%s sslmode=%s user=%s password=%s",
-		sqlHost, sqlPort, sqlDbName, sqlSslmode, sqlUser, sqlPassword)
-	//sqlDsn := "host=" + sqlUri + " dbname=" + sqlDatabase + " user=" + sqlUser + " password=" + sqlPassword
+// Connect establishes connections to multiple schemas in the same PostgreSQL database
+func Connect(sqlHost, sqlPort, sqlDbName, sqlSslmode, sqlUser, sqlPassword string, schemas []string) error {
+	dbMutex.Lock()
+	defer dbMutex.Unlock()
 
-	database, err := gorm.Open(postgres.New(postgres.Config{
-		DSN: sqlDsn,
-	}), &gorm.Config{
-		NamingStrategy: schema.NamingStrategy{
-			TablePrefix:   currentSchema + ".", // schema name
-			SingularTable: true,                // use singular table name, table for `User` would be `user` with this option enabled
-			//NoLowerCase:   true,                // skip the snake_casing of names
-		}})
-
-	if err != nil {
-		panic("Failed to connect to database!")
+	if len(schemas) == 0 {
+		return errors.New("at least one schema must be provided")
 	}
 
-	// Add uuid-ossp extension for postgres database
-	database.Exec("CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";")
-	/*
-		// Migrate tables
-		if len(autoMigrateModelList) > 0 {
-			err = database.AutoMigrate(autoMigrateModelList...)
-			if err != nil {
-				panic("Failed to AutoMigrate table! err: " + err.Error())
-			}
+	for _, currentSchema := range schemas {
+		sqlDsn := fmt.Sprintf("host=%s port=%s dbname=%s sslmode=%s user=%s password=%s",
+			sqlHost, sqlPort, sqlDbName, sqlSslmode, sqlUser, sqlPassword)
+
+		database, err := gorm.Open(postgres.New(postgres.Config{
+			DSN: sqlDsn,
+		}), &gorm.Config{
+			NamingStrategy: schema.NamingStrategy{
+				TablePrefix:   currentSchema + ".", // schema name
+				SingularTable: true,                // use singular table name
+			},
+		})
+
+		if err != nil {
+			return fmt.Errorf("failed to connect to database for schema %s: %w", currentSchema, err)
 		}
-	*/
-	defaultDB = database
+
+		// Add uuid-ossp extension for postgres database
+		database.Exec("CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";")
+
+		dbMap[currentSchema] = database
+	}
+
+	// Set default schema as the first one provided
+	defaultSchema = schemas[0]
 	Connected = true
 
+	// Todo: set connection pool for each database connection
 	/*
-		Todo: set connection Pool
-			// Get generic database object sql.DB to use its functions
-			sqlDB, err := defaultDB.DB()
+		for _, db := range dbMap {
+			sqlDB, err := db.DB()
 			if err != nil {
 				return err
 			}
-			// SetMaxIdleConns sets the maximum number of connections in the idle connection pool.
 			sqlDB.SetMaxIdleConns(10)
-
-			// SetMaxOpenConns sets the maximum number of open connections to the database.
 			sqlDB.SetMaxOpenConns(100)
-
-			// SetConnMaxLifetime sets the maximum amount of time a connection may be reused.
 			sqlDB.SetConnMaxLifetime(time.Hour)
+		}
 	*/
 	// Todo: optimize performance https://gorm.io/docs/performance.html
 	return nil
 }
 
-func Migrate(models ...interface{}) error {
+// Migrate runs AutoMigrate for the specified schema
+func Migrate(schemaName string, models ...interface{}) error {
+	dbMutex.RLock()
+	defer dbMutex.RUnlock()
+
 	if !Connected {
 		return errors.New("database not connected")
 	}
 
-	err := defaultDB.AutoMigrate(models...)
+	db, exists := dbMap[schemaName]
+	if !exists {
+		return fmt.Errorf("schema %s not connected", schemaName)
+	}
+
+	err := db.AutoMigrate(models...)
 	return err
 }
 
-func Ping() error {
+// Ping checks the connection for the specified schema
+func Ping(schemaName string) error {
+	dbMutex.RLock()
+	defer dbMutex.RUnlock()
+
 	if !Connected {
 		return errors.New("not connected")
 	}
-	sqlDB, err := defaultDB.DB()
+
+	db, exists := dbMap[schemaName]
+	if !exists {
+		return fmt.Errorf("schema %s not connected", schemaName)
+	}
+
+	sqlDB, err := db.DB()
 	if err != nil {
 		return err
 	}
@@ -102,59 +123,95 @@ func Ping() error {
 	return nil
 }
 
+// Close closes all database connections
 func Close() error {
+	dbMutex.Lock()
+	defer dbMutex.Unlock()
+
 	if !Connected {
 		return errors.New("not connected")
 	}
-	sqlDB, err := defaultDB.DB()
-	if err != nil {
-		return err
+
+	for schemaName, db := range dbMap {
+		sqlDB, err := db.DB()
+		if err != nil {
+			return fmt.Errorf("failed to get sql.DB for schema %s: %w", schemaName, err)
+		}
+		if err := sqlDB.Close(); err != nil {
+			return fmt.Errorf("failed to close connection for schema %s: %w", schemaName, err)
+		}
 	}
-	err = sqlDB.Close()
-	if err != nil {
-		return err
-	}
+	dbMap = make(map[string]*gorm.DB)
 	Connected = false
+	defaultSchema = ""
 	return nil
 }
 
-func Stats() (stats sql.DBStats, err error) {
+// Stats returns database statistics for the specified schema
+func Stats(schemaName string) (stats sql.DBStats, err error) {
+	dbMutex.RLock()
+	defer dbMutex.RUnlock()
+
 	if !Connected {
 		return stats, errors.New("not connected")
 	}
-	// Returns database statistics
-	sqlDB, err := defaultDB.DB()
+
+	db, exists := dbMap[schemaName]
+	if !exists {
+		return stats, fmt.Errorf("schema %s not connected", schemaName)
+	}
+
+	sqlDB, err := db.DB()
 	if err != nil {
 		return stats, err
 	}
 	return sqlDB.Stats(), nil
 }
 
-// NewQuery create new query instance
-func NewQuery[M any, E any]( /*db *gorm.DB*/ dbInstances ...interface{}) *SQLQuery[M, E] {
-	query := &SQLQuery[M, E]{}
+// SQLQuery represents a query with schema support
+type SQLQuery[M any, E any] struct {
+	expressStr string
+	args       []interface{}
+	db         *gorm.DB
+	schema     string
+}
 
-	var isDBInitiallized bool = false
+// NewQuery creates a new query instance for the specified schema
+func NewQuery[M any, E any](schemaName string, dbInstances ...interface{}) *SQLQuery[M, E] {
+	query := &SQLQuery[M, E]{schema: schemaName}
+
+	var isDBInitialized bool = false
 	for _, db := range dbInstances {
 		if db != nil {
 			switch t := db.(type) {
 			case *gorm.DB:
 				if t != nil {
 					query.db = t
-					isDBInitiallized = true
+					isDBInitialized = true
 				}
 			default:
 			}
 		}
 	}
 
-	// Assign default DB
-	if !isDBInitiallized && defaultDB != nil {
-		query.db = defaultDB
-		isDBInitiallized = true
+	// Assign default DB for the schema
+	dbMutex.RLock()
+	defer dbMutex.RUnlock()
+
+	if !isDBInitialized {
+		if schemaName == "" {
+			schemaName = defaultSchema
+		}
+		db, exists := dbMap[schemaName]
+		if !exists {
+			panic(fmt.Sprintf("schema %s not initialized", schemaName))
+		}
+		query.db = db
+		isDBInitialized = true
 	}
-	if !isDBInitiallized {
-		panic(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> database is not initialized")
+
+	if !isDBInitialized {
+		panic("database is not initialized")
 	}
 
 	query.expressStr = ""
@@ -162,7 +219,7 @@ func NewQuery[M any, E any]( /*db *gorm.DB*/ dbInstances ...interface{}) *SQLQue
 	return query
 }
 
-// AddConditionOfTextField add one filter condition of normal text field into query
+// AddConditionOfTextField adds a filter condition for a text field
 func (query *SQLQuery[M, E]) AddConditionOfTextField(cascadingLogic string, fieldName string, comparisonOperator string, value interface{}) {
 	if fieldName == "" {
 		return
@@ -176,11 +233,9 @@ func (query *SQLQuery[M, E]) AddConditionOfTextField(cascadingLogic string, fiel
 		}
 	} else {
 		if comparisonOperator == "LIKE" {
-
 			query.expressStr = fmt.Sprintf("%s %s lower(\"%s\") %s ?", query.expressStr, cascadingLogic, fieldName, comparisonOperator)
 		} else {
 			query.expressStr = fmt.Sprintf("%s %s \"%s\" %s ?", query.expressStr, cascadingLogic, fieldName, comparisonOperator)
-
 		}
 	}
 
@@ -195,7 +250,7 @@ func (query *SQLQuery[M, E]) AddConditionOfTextField(cascadingLogic string, fiel
 	}
 }
 
-// AddTwoConditionOfTextField add two filter condition of two normal text field into query
+// AddTwoConditionOfTextField adds two filter conditions for text fields
 func (query *SQLQuery[M, E]) AddTwoConditionOfTextField(cascadingLogic string, fieldName1 string, comparisonOperator1 string, value1 interface{}, combineLogic string, fieldName2 string, comparisonOperator2 string, value2 interface{}) {
 	if fieldName1 == "" || fieldName2 == "" {
 		return
@@ -220,7 +275,6 @@ func (query *SQLQuery[M, E]) AddTwoConditionOfTextField(cascadingLogic string, f
 			query.expressStr = fmt.Sprintf("%s %s lower(\"%s\") %s ? %s lower(\"%s\") %s ?", query.expressStr, cascadingLogic, fieldName1, comparisonOperator1, combineLogic, fieldName2, comparisonOperator2)
 		} else {
 			query.expressStr = fmt.Sprintf("%s %s \"%s\" %s ? %s \"%s\" %s ?", query.expressStr, cascadingLogic, fieldName1, comparisonOperator1, combineLogic, fieldName2, comparisonOperator2)
-
 		}
 	}
 
@@ -245,7 +299,7 @@ func (query *SQLQuery[M, E]) AddTwoConditionOfTextField(cascadingLogic string, f
 	}
 }
 
-// AddConditionOfJsonbField add one filter condition of jsonb field into query
+// AddConditionOfJsonbField adds a filter condition for a JSONB field
 func (query *SQLQuery[M, E]) AddConditionOfJsonbField(cascadingLogic string, fieldName string, key string, comparisonOperator string, value interface{}) {
 	if fieldName == "" {
 		return
@@ -253,13 +307,13 @@ func (query *SQLQuery[M, E]) AddConditionOfJsonbField(cascadingLogic string, fie
 
 	if query.expressStr == "" {
 		if comparisonOperator == "LIKE" {
-			query.expressStr = fmt.Sprintf("lower(\"%s\") ->> '%s' %s ?", fieldName, key, comparisonOperator)
+			query.expressStr = fmt.Sprintf("lower(\"%s\" ->> '%s') %s ?", fieldName, key, comparisonOperator)
 		} else {
 			query.expressStr = fmt.Sprintf("\"%s\" ->> '%s' %s ?", fieldName, key, comparisonOperator)
 		}
 	} else {
 		if comparisonOperator == "LIKE" {
-			query.expressStr = fmt.Sprintf("%s %s lower(\"%s\") ->> '%s' %s ?", query.expressStr, cascadingLogic, fieldName, key, comparisonOperator)
+			query.expressStr = fmt.Sprintf("%s %s lower(\"%s\" ->> '%s') %s ?", query.expressStr, cascadingLogic, fieldName, key, comparisonOperator)
 		} else {
 			query.expressStr = fmt.Sprintf("%s %s \"%s\" ->> '%s' %s ?", query.expressStr, cascadingLogic, fieldName, key, comparisonOperator)
 		}
@@ -276,7 +330,7 @@ func (query *SQLQuery[M, E]) AddConditionOfJsonbField(cascadingLogic string, fie
 	}
 }
 
-// Exec run the the query to get all items with current filter, no paging
+// ExecNoPaging executes the query without pagination
 func (query *SQLQuery[M, E]) ExecNoPaging(sort string) (dtos []M, count int64, err error) {
 	if !Connected {
 		return dtos, 0, errors.New("database not connected")
@@ -291,18 +345,14 @@ func (query *SQLQuery[M, E]) ExecNoPaging(sort string) (dtos []M, count int64, e
 		sort = "\"created_at\"" + " desc"
 	}
 
-	// Query with filter
 	var items []E
-	result := defaultDB.Order(sort).Where(query.expressStr, query.args...).Find(&items)
+	result := query.db.Order(sort).Where(query.expressStr, query.args...).Find(&items)
 	if result.Error != nil {
 		return dtos, count, result.Error
 	}
-	//count = result.RowsAffected
 
-	// Map entity item to DTO model
 	dtos = make([]M, 0)
 	for _, item := range items {
-		// Mapping from entity model to DTO model
 		var dto M
 		if err := dtoMapper.Map(&dto, item); err != nil {
 			return dtos, count, err
@@ -311,17 +361,15 @@ func (query *SQLQuery[M, E]) ExecNoPaging(sort string) (dtos []M, count int64, e
 		count++
 	}
 
-	// Return
 	return dtos, count, result.Error
 }
 
-// ExecPaging run the the query to get items with current filter, with paging
+// ExecWithPaging executes the query with pagination
 func (query *SQLQuery[M, E]) ExecWithPaging(sort string, limit int, page int) (dtos []M, count int64, err error) {
 	if !Connected {
 		return dtos, 0, errors.New("database not connected")
 	}
 
-	// Validate query param
 	if limit < 1 {
 		limit = 100
 	}
@@ -336,25 +384,22 @@ func (query *SQLQuery[M, E]) ExecWithPaging(sort string, limit int, page int) (d
 		sort = "\"created_at\"" + " desc"
 	}
 
-	// Calculate offset
 	offset := limit * (page - 1)
-	var result *gorm.DB
 
-	// Count total number
 	var entityModel E
-	result = query.db.Model(entityModel).Where(query.expressStr, query.args...).Count(&count)
+	result := query.db.Model(entityModel).Where(query.expressStr, query.args...).Count(&count)
 	if result.Error != nil {
 		return dtos, 0, result.Error
 	}
 
-	// Query with filter
 	var items []E
 	result = query.db.Limit(limit).Offset(offset).Order(sort).Where(query.expressStr, query.args...).Find(&items)
+	if result.Error != nil {
+		return dtos, count, result.Error
+	}
 
-	// Map entity item to DTO model
 	dtos = make([]M, 0)
 	for _, item := range items {
-		// Mapping from entity model to DTO model
 		var dto M
 		if err := dtoMapper.Map(&dto, item); err != nil {
 			return dtos, count, err
@@ -365,71 +410,91 @@ func (query *SQLQuery[M, E]) ExecWithPaging(sort string, limit int, page int) (d
 	return dtos, count, result.Error
 }
 
-// CreateItemFromDTO map dto (data transfer object) to new database's item struct
-// and write that item into database , accepts generic types
-//
-// It return created item and error
-func CreateItemFromDTO[M any, E any](dto M) (M, error) {
+// CreateItemFromDTO creates a new item in the specified schema
+func CreateItemFromDTO[M any, E any](schemaName string, dto M) (M, error) {
+	dbMutex.RLock()
+	defer dbMutex.RUnlock()
+
 	if !Connected {
 		return dto, errors.New("database not connected")
 	}
 
-	// Validate dto object  input
+	if schemaName == "" {
+		schemaName = defaultSchema
+	}
+	db, exists := dbMap[schemaName]
+	if !exists {
+		return dto, fmt.Errorf("schema %s not connected", schemaName)
+	}
+
 	validate := validator.New()
 	err := validate.Struct(dto)
 	if err != nil {
 		return dto, err
 	}
 
-	// Mapping from DTO to entity model
 	var item E
 	if err := dtoMapper.Map(&item, dto); err != nil {
 		return dto, err
 	}
 
-	// Create new entity using smart select
 	var entity E
-	if result := defaultDB.Model(entity).Create(&item); result.Error != nil {
+	if result := db.Model(entity).Create(&item); result.Error != nil {
 		return dto, result.Error
 	}
 
-	// Mapping from entity model to DTO model
 	if err := dtoMapper.Map(&dto, item); err != nil {
 		return dto, err
 	}
 	return dto, nil
 }
 
-// ReadItemIntoDTO read an item by ID from database then map resutl into dto (data transfer object),
-// accepts generic types
-//
-// It return read dto and error
-func ReadItemByIDIntoDTO[M any, E any](id string) (dto M, err error) {
+// ReadItemByIDIntoDTO reads an item by ID from the specified schema
+func ReadItemByIDIntoDTO[M any, E any](schemaName string, id string) (dto M, err error) {
+	dbMutex.RLock()
+	defer dbMutex.RUnlock()
+
 	if !Connected {
 		return dto, errors.New("database not connected")
 	}
+
+	if schemaName == "" {
+		schemaName = defaultSchema
+	}
+	db, exists := dbMap[schemaName]
+	if !exists {
+		return dto, fmt.Errorf("schema %s not connected", schemaName)
+	}
+
 	var item E
-	if err := defaultDB.Where("id = ?", id).First(&item).Error; err != nil {
+	if err := db.Where("id = ?", id).First(&item).Error; err != nil {
 		return dto, err
 	}
 
-	// Mapping from entity model to DTO model
 	if err := dtoMapper.Map(&dto, item); err != nil {
 		return dto, err
 	}
 	return dto, nil
 }
 
-// ReadItemIntoDTO read an item by ID from database then map resutl into dto (data transfer object),
-// accepts generic types
-//
-// It return read dtos and error
-func ReadMultiItemsByIDIntoDTO[M any, E any](ids []string, sort string) (dtos []M, count int64, err error) {
+// ReadMultiItemsByIDIntoDTO reads multiple items by IDs from the specified schema
+func ReadMultiItemsByIDIntoDTO[M any, E any](schemaName string, ids []string, sort string) (dtos []M, count int64, err error) {
+	dbMutex.RLock()
+	defer dbMutex.RUnlock()
+
 	if !Connected {
 		return dtos, 0, errors.New("database not connected")
 	}
-	count = 0
 
+	if schemaName == "" {
+		schemaName = defaultSchema
+	}
+	db, exists := dbMap[schemaName]
+	if !exists {
+		return dtos, 0, fmt.Errorf("schema %s not connected", schemaName)
+	}
+
+	count = 0
 	if strings.HasPrefix(sort, "-") {
 		sort = "\"" + strings.TrimPrefix(sort, "-") + "\"" + " desc"
 	} else if strings.HasPrefix(sort, "+") {
@@ -439,53 +504,11 @@ func ReadMultiItemsByIDIntoDTO[M any, E any](ids []string, sort string) (dtos []
 	}
 
 	var items []E
-	result := defaultDB.Order(sort).Where("id IN ?", ids).Find(&items)
+	result := db.Order(sort).Where("id IN ?", ids).Find(&items)
 	if result.Error != nil {
 		return dtos, 0, result.Error
 	}
-	//count = result.RowsAffected
 
-	dtos = make([]M, 0)
-	for _, item := range items {
-		// Mapping from entity model to DTO model
-		var dto M
-		if err := dtoMapper.Map(&dto, item); err != nil {
-			return dtos, count, err
-		}
-		dtos = append(dtos, dto)
-		count++
-	}
-
-	return dtos, count, nil
-}
-
-// ReadItemIntoDTO read an item by ID from database then map resutl into dto (data transfer object),
-// accepts generic types
-//
-// It return read dtos and error
-func ReadAllItemsIntoDTO[M any, E any](sort string) (dtos []M, count int64, err error) {
-	if !Connected {
-		return dtos, 0, errors.New("database not connected")
-	}
-	count = 0
-
-	if strings.HasPrefix(sort, "-") {
-		sort = "\"" + strings.TrimPrefix(sort, "-") + "\"" + " desc"
-	} else if strings.HasPrefix(sort, "+") {
-		sort = "\"" + strings.TrimPrefix(sort, "+") + "\"" + " asc"
-	} else {
-		sort = "\"created_at\"" + " desc"
-	}
-
-	var items []E
-
-	result := defaultDB.Order(sort).Find(&items)
-	if result.Error != nil {
-		return dtos, 0, result.Error
-	}
-	//count = result.RowsAffected
-
-	// Mapping from entity model to DTO model
 	dtos = make([]M, 0)
 	for _, item := range items {
 		var dto M
@@ -499,22 +522,74 @@ func ReadAllItemsIntoDTO[M any, E any](sort string) (dtos []M, count int64, err 
 	return dtos, count, nil
 }
 
-// ReadItemWithFilterIntoDTO read an item with Filter from database then map resutl into dto (data transfer object),
-// accepts generic types
-//
-// It return read dto and error
-func ReadItemWithFilterIntoDTO[M any, E any](query string, args ...interface{}) (dto M, err error) {
+// ReadAllItemsIntoDTO reads all items from the specified schema
+func ReadAllItemsIntoDTO[M any, E any](schemaName string, sort string) (dtos []M, count int64, err error) {
+	dbMutex.RLock()
+	defer dbMutex.RUnlock()
+
+	if !Connected {
+		return dtos, 0, errors.New("database not connected")
+	}
+
+	if schemaName == "" {
+		schemaName = defaultSchema
+	}
+	db, exists := dbMap[schemaName]
+	if !exists {
+		return dtos, 0, fmt.Errorf("schema %s not connected", schemaName)
+	}
+
+	count = 0
+	if strings.HasPrefix(sort, "-") {
+		sort = "\"" + strings.TrimPrefix(sort, "-") + "\"" + " desc"
+	} else if strings.HasPrefix(sort, "+") {
+		sort = "\"" + strings.TrimPrefix(sort, "+") + "\"" + " asc"
+	} else {
+		sort = "\"created_at\"" + " desc"
+	}
+
+	var items []E
+	result := db.Order(sort).Find(&items)
+	if result.Error != nil {
+		return dtos, 0, result.Error
+	}
+
+	dtos = make([]M, 0)
+	for _, item := range items {
+		var dto M
+		if err := dtoMapper.Map(&dto, item); err != nil {
+			return dtos, count, err
+		}
+		dtos = append(dtos, dto)
+		count++
+	}
+
+	return dtos, count, nil
+}
+
+// ReadItemWithFilterIntoDTO reads an item with a filter from the specified schema
+func ReadItemWithFilterIntoDTO[M any, E any](schemaName string, query string, args ...interface{}) (dto M, err error) {
+	dbMutex.RLock()
+	defer dbMutex.RUnlock()
+
 	if !Connected {
 		return dto, errors.New("database not connected")
 	}
 
+	if schemaName == "" {
+		schemaName = defaultSchema
+	}
+	db, exists := dbMap[schemaName]
+	if !exists {
+		return dto, fmt.Errorf("schema %s not connected", schemaName)
+	}
+
 	var item E
-	result := defaultDB.Where(query, args...).First(&item)
+	result := db.Where(query, args...).First(&item)
 	if result.Error != nil {
 		return dto, result.Error
 	}
 
-	// Mapping from entity model to DTO model
 	if err := dtoMapper.Map(&dto, item); err != nil {
 		return dto, err
 	}
@@ -522,78 +597,92 @@ func ReadItemWithFilterIntoDTO[M any, E any](query string, args ...interface{}) 
 	return dto, nil
 }
 
-// UpdateItemByIDIntoDTO check if item ID exist in database, then map dto to item struct for updating it (actually patching),
-// accepts generic types. Empty (null) field will not be updated
-//
-// It return updated item (dto) and error
-func UpdateItemByIDFromDTO[M any, E any](id string, dto M) (M, error) {
+// UpdateItemByIDFromDTO updates an item by ID in the specified schema
+func UpdateItemByIDFromDTO[M any, E any](schemaName string, id string, dto M) (M, error) {
+	dbMutex.RLock()
+	defer dbMutex.RUnlock()
+
 	if !Connected {
 		return dto, errors.New("database not connected")
 	}
 
-	// Check item exist by ID
+	if schemaName == "" {
+		schemaName = defaultSchema
+	}
+	db, exists := dbMap[schemaName]
+	if !exists {
+		return dto, fmt.Errorf("schema %s not connected", schemaName)
+	}
+
 	var item E
-	if err := defaultDB.Where("id = ?", id).First(&item).Error; err != nil {
+	if err := db.Where("id = ?", id).First(&item).Error; err != nil {
 		return dto, err
 	}
 
-	// Mapping from DTO to entity model
 	if err := dtoMapper.Map(&item, dto); err != nil {
 		return dto, err
 	}
 
-	// Update item
-	if err := defaultDB.Model(item).Where("id = ?", id).Updates(&item).Error; err != nil {
+	if err := db.Model(item).Where("id = ?", id).Updates(&item).Error; err != nil {
 		return dto, err
 	}
 
-	// Mapping back from updated entity to DTO
 	if err := dtoMapper.Map(&dto, item); err != nil {
 		return dto, err
 	}
 
-	// Todo: uuid of dto is not updated here, please make dto's id updated here
 	return dto, nil
 }
 
-// DeleteItemByID delete item by ID,
-// accepts generic types.
-//
-// It return error if there is any
-func DeleteItemByID[E any](id string) (err error) {
+// DeleteItemByID deletes an item by ID in the specified schema
+func DeleteItemByID[E any](schemaName string, id string) (err error) {
+	dbMutex.RLock()
+	defer dbMutex.RUnlock()
+
 	if !Connected {
 		return errors.New("database not connected")
 	}
 
+	if schemaName == "" {
+		schemaName = defaultSchema
+	}
+	db, exists := dbMap[schemaName]
+	if !exists {
+		return fmt.Errorf("schema %s not connected", schemaName)
+	}
+
 	var item E
-	if err = defaultDB.Where("id = ?", id).Delete(&item).Error; err != nil {
+	if err = db.Where("id = ?", id).Delete(&item).Error; err != nil {
 		return err
 	}
 
 	return nil
 }
 
-// DeleteAllItem delete all item,
-// accepts generic types.
-//
-// It return error if there is any
-func DeleteAllItem[E any](softDelete bool) (err error) {
+// DeleteAllItem deletes all items in the specified schema
+func DeleteAllItem[E any](schemaName string, softDelete bool) (err error) {
+	dbMutex.RLock()
+	defer dbMutex.RUnlock()
+
 	if !Connected {
 		return errors.New("database not connected")
 	}
 
+	if schemaName == "" {
+		schemaName = defaultSchema
+	}
+	db, exists := dbMap[schemaName]
+	if !exists {
+		return fmt.Errorf("schema %s not connected", schemaName)
+	}
+
 	var item E
 	if softDelete {
-		// Softdelete: the record WON'T be removed from the database,
-		// but GORM will set the DeletedAt's value to the current time,
-		// and the data is not findable with normal Query methods anymore.
-		// You can find soft deleted records with Unscoped:
-		// db.Unscoped().Where("age = 20").Find(&user)
-		if err = defaultDB.Where("created_at > ?", "2000-01-01 00:00:00").Delete(&item).Error; err != nil {
+		if err = db.Where("created_at > ?", "2000-01-01 00:00:00").Delete(&item).Error; err != nil {
 			return err
 		}
 	} else {
-		if err = defaultDB.Unscoped().Where("created_at > ?", "2000-01-01 00:00:00").Delete(&item).Error; err != nil {
+		if err = db.Unscoped().Where("created_at > ?", "2000-01-01 00:00:00").Delete(&item).Error; err != nil {
 			return err
 		}
 	}
@@ -601,48 +690,61 @@ func DeleteAllItem[E any](softDelete bool) (err error) {
 	return nil
 }
 
-// CheckItemExistedByID check item is existed by ID,
-// accepts generic types.
-//
-// It return true if item is existed
-func CheckItemExistedByID[E any](id string) (exists bool, err error) {
+// CheckItemExistedByID checks if an item exists by ID in the specified schema
+func CheckItemExistedByID[E any](schemaName string, id string) (exists bool, err error) {
+	dbMutex.RLock()
+	defer dbMutex.RUnlock()
+
 	if !Connected {
 		return exists, errors.New("database not connected")
 	}
 
+	if schemaName == "" {
+		schemaName = defaultSchema
+	}
+	db, exists := dbMap[schemaName]
+	if !exists {
+		return exists, fmt.Errorf("schema %s not connected", schemaName)
+	}
+
 	var item E
-	if err = defaultDB.Model(item).Select("count(*) > 0").Where("id = ?", id).Find(&exists).Error; err != nil {
+	if err = db.Model(item).Select("count(*) > 0").Where("id = ?", id).Find(&exists).Error; err != nil {
 		return exists, err
 	}
 
 	return exists, nil
 }
 
-// UpdateSingleColumn check if item ID exist in database, then updating it (actually patching),
-// accepts generic types. Empty (null) field will not be updated
-//
-// It return error
-func UpdateSingleColumn[E any](id string, columnName string, value interface{}) error {
+// UpdateSingleColumn updates a single column for an item in the specified schema
+func UpdateSingleColumn[E any](schemaName string, id string, columnName string, value interface{}) error {
+	dbMutex.RLock()
+	defer dbMutex.RUnlock()
+
 	if !Connected {
 		return errors.New("database not connected")
 	}
-	// Check item exist by ID
+
+	if schemaName == "" {
+		schemaName = defaultSchema
+	}
+	db, exists := dbMap[schemaName]
+	if !exists {
+		return fmt.Errorf("schema %s not connected", schemaName)
+	}
+
 	var item E
-	if err := defaultDB.Where("id = ?", id).First(&item).Error; err != nil {
+	if err := db.Where("id = ?", id).First(&item).Error; err != nil {
 		return err
 	}
 
-	// Update item
-	if err := defaultDB.Model(item).Where("id = ?", id).Update(columnName, value).Error; err != nil {
+	if err := db.Model(item).Where("id = ?", id).Update(columnName, value).Error; err != nil {
 		return err
 	}
 
 	return nil
 }
 
-//===============================
-
-// AddJoin adds a JOIN clause to the query for joining multiple tables
+// AddJoin adds a JOIN clause to the query
 func (query *SQLQuery[M, E]) AddJoin(joinType, table, condition string) *SQLQuery[M, E] {
 	query.db = query.db.Joins(fmt.Sprintf("%s %s ON %s", joinType, table, condition))
 	return query
@@ -654,7 +756,7 @@ func (query *SQLQuery[M, E]) AddPreload(relation string) *SQLQuery[M, E] {
 	return query
 }
 
-// ExecCustomQuery executes a custom SQL query with support for multiple tables
+// ExecCustomQuery executes a custom SQL query
 func (query *SQLQuery[M, E]) ExecCustomQuery(rawQuery string, args ...interface{}) (dtos []M, count int64, err error) {
 	if !Connected {
 		return dtos, 0, errors.New("database not connected")
@@ -679,13 +781,12 @@ func (query *SQLQuery[M, E]) ExecCustomQuery(rawQuery string, args ...interface{
 	return dtos, count, nil
 }
 
-// ExecCustomQueryWithPaging executes a custom SQL query with pagination support
+// ExecCustomQueryWithPaging executes a custom SQL query with pagination
 func (query *SQLQuery[M, E]) ExecCustomQueryWithPaging(rawQuery string, limit, page int, args ...interface{}) (dtos []M, count int64, err error) {
 	if !Connected {
 		return dtos, 0, errors.New("database not connected")
 	}
 
-	// Validate query parameters
 	if limit < 1 {
 		limit = 100
 	}
@@ -693,17 +794,14 @@ func (query *SQLQuery[M, E]) ExecCustomQueryWithPaging(rawQuery string, limit, p
 		page = 1
 	}
 
-	// Calculate offset
 	offset := limit * (page - 1)
 
-	// Count total number
 	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM (%s) AS count_query", rawQuery)
 	result := query.db.Raw(countQuery, args...).Scan(&count)
 	if result.Error != nil {
 		return dtos, 0, result.Error
 	}
 
-	// Execute query with pagination
 	var items []E
 	paginatedQuery := fmt.Sprintf("%s LIMIT %d OFFSET %d", rawQuery, limit, offset)
 	result = query.db.Raw(paginatedQuery, args...).Scan(&items)
@@ -711,7 +809,6 @@ func (query *SQLQuery[M, E]) ExecCustomQueryWithPaging(rawQuery string, limit, p
 		return dtos, count, result.Error
 	}
 
-	// Map entity items to DTOs
 	dtos = make([]M, 0)
 	for _, item := range items {
 		var dto M
